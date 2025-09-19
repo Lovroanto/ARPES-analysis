@@ -49,7 +49,8 @@ def print_data_info(exit_slit, exit_tilt, hv, image, attrs):
     
     # Print some attribute values that might be useful
     useful_attrs = ['Axis0.Scale', 'Axis1.Scale', 'Axis2.Scale', 
-                   'Axis1.FirstVal', 'Axis1.StepVal', 'Axis2.FirstVal', 'Axis2.StepVal']
+                   'Axis1.FirstVal', 'Axis1.StepVal', 'Axis2.FirstVal', 'Axis2.StepVal',
+                   'Excitation Energy (eV)', 'Work Function (eV)']
     for attr in useful_attrs:
         if attr in attrs:
             print(f"  {attr}: {attrs[attr]}")
@@ -66,7 +67,7 @@ def process_fermi_surface(image_data, exit_slit_data, exit_tilt_data, hv_data, a
         print(f"Slit range: {slit.min():.2f}° to {slit.max():.2f}°")
         print(f"Tilt range: {tilt.min():.2f}° to {tilt.max():.2f}°")
         
-        # Get intensity data (slice at Fermi or use full if 2D)
+        # Get intensity data (slice at Fermi)
         intensity = get_fermi_intensity(image_data, hv_data, attrs)
         print(f"Intensity shape: {intensity.shape}")
         
@@ -116,32 +117,44 @@ def get_angle_scales(exit_slit, exit_tilt, attrs, image_shape):
     return slit, tilt
 
 def get_scale_from_attrs(attrs, axis_name, n_points):
-    """Try to reconstruct scale from HDF5 attributes"""
-    if f'{axis_name}.FirstVal' in attrs and f'{axis_name}.StepVal' in attrs:
-        first_val = attrs[f'{axis_name}.FirstVal']
-        step_val = attrs[f'{axis_name}.StepVal']
-        scale = first_val + np.arange(n_points) * step_val
-        return scale
-    elif f'{axis_name}.Scale' in attrs:
-        scale = attrs[f'{axis_name}.Scale']
-        if len(scale) == n_points:
+    """Try to reconstruct scale from HDF5 attributes (handles [start, step] format)"""
+    scale_key = f'{axis_name}.Scale'
+    if scale_key in attrs:
+        scale_data = attrs[scale_key]
+        if len(scale_data) == 2:  # [start, step] format
+            start, step = scale_data
+            scale = start + np.arange(n_points) * step
             return scale
+        elif len(scale_data) == n_points:  # Full scale list
+            return scale_data
+    # Also check old FirstVal/StepVal (for compatibility)
+    first_key = f'{axis_name}.FirstVal'
+    step_key = f'{axis_name}.StepVal'
+    if first_key in attrs and step_key in attrs:
+        start = attrs[first_key]
+        step = attrs[step_key]
+        scale = start + np.arange(n_points) * step
+        return scale
     return None
 
 def get_fermi_intensity(image_data, hv_data, attrs):
-    """Get intensity at Fermi level or integrate around it"""
+    """Get intensity at Fermi level (max kinetic energy)"""
     if image_data.ndim == 3:
         # 3D data: (n_frames/energy, ny, nx)
-        if hv_data is not None:
-            # Find Fermi energy (assuming E=0 is Fermi for binding energy)
-            fermi_idx = np.argmin(np.abs(hv_data))
-            print(f"Slicing at Fermi index {fermi_idx} (E={hv_data[fermi_idx]:.3f} eV)")
-            intensity = image_data[fermi_idx, :, :]
+        if 'Axis0.Scale' in attrs:
+            # Reconstruct energy scale from attributes [start, step]
+            energy_start, energy_step = attrs['Axis0.Scale']
+            n_energies = image_data.shape[0]
+            energies = energy_start + np.arange(n_energies) * energy_step
+            # Fermi at highest kinetic energy
+            fermi_idx = np.argmax(energies)
+            print(f"Slicing at Fermi index {fermi_idx} (KE={energies[fermi_idx]:.3f} eV)")
         else:
-            # No energy scale, take middle or first frame
-            fermi_idx = image_data.shape[0] // 2
-            print(f"No energy scale found, using frame {fermi_idx}")
-            intensity = image_data[fermi_idx, :, :]
+            # No energy scale, take last frame (highest energy)
+            fermi_idx = image_data.shape[0] - 1
+            print(f"No energy scale found, using last frame {fermi_idx} (assumed Fermi)")
+        
+        intensity = image_data[fermi_idx, :, :]
     else:
         # 2D data: already at Fermi
         intensity = image_data[0, :, :] if image_data.ndim == 3 else image_data
@@ -151,21 +164,26 @@ def get_fermi_intensity(image_data, hv_data, attrs):
 def convert_to_kspace(data_array, attrs, file_path):
     """Convert angle data to momentum space using your operation function"""
     
-    # Get kinetic energy from filename or attributes
-    Ec = extract_energy_from_filename(file_path)
-    if Ec is None:
-        # Try attributes or default
-        if 'PhotonEnergy' in attrs:
-            Ec = attrs['PhotonEnergy']
-        else:
-            Ec = 25.0  # from filename
-        print(f"Using kinetic energy: {Ec} eV")
+    # Get kinetic energy from attributes (Excitation Energy is photon energy ~25 eV)
+    # Fermi KE = hv - work function, but since we slice at max KE, use max KE for conversion
+    if 'Excitation Energy (eV)' in attrs:
+        hv = attrs['Excitation Energy (eV)']
+        work_function = attrs.get('Work Function (eV)', 0.0)
+        Ec = hv - work_function  # Theoretical max KE at Fermi
+        print(f"Max KE at Fermi: {Ec:.2f} eV (hv={hv:.2f} eV, WF={work_function:.2f} eV)")
+    else:
+        Ec = 25.0  # Fallback from filename
+        print(f"Using kinetic energy: {Ec} eV (no attrs found)")
     
     # Calibration parameters (you'll need to adjust these)
     angle_correction = 0.0   # degrees (phi rotation)
-    shiftx = 0.0             # slit shift (degrees)
-    shifty = 0.0             # tilt shift (degrees)
-    unit = 'Angstrom-1'      # or 'BZ' if you define lattice constant
+    shiftx = 0.0             # slit (kx) shift in degrees  
+    shifty = 0.0             # tilt (ky) shift in degrees
+    unit = 'Angstrom-1'      # or 'BZ' if you define lattice constant below
+    
+    # For 'BZ' units, define lattice constant a (in Angstroms) here, e.g.:
+    # a = 3.8  # Example for some cuprate; set your material's value
+    # Then change unit = 'BZ' above
     
     print(f"Converting to k-space with:")
     print(f"  Ec = {Ec} eV, unit = {unit}")
@@ -204,6 +222,11 @@ def extract_energy_from_filename(filepath):
 def plot_fermi_surface(data_fs, unit='Angstrom-1'):
     """Plot the Fermi surface using your plotting function"""
     print("Generating Fermi surface plot...")
+    
+    # Temporary fix for set_unit error: define 'a' globally if using 'BZ'
+    # (Uncomment if you switch to unit='BZ' and set your value)
+    # a = 3.8  # Your lattice constant in Å
+    # globals()['a'] = a  # Make 'a' available to ARPES.set_unit
     
     # Use your existing plot function
     fig, ax = ARPES.plot_ARPES_FS(data_fs, E=0, unit=unit, c='terrain_r')
